@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from app.studio import content_types, graph, retrieval
+from app.studio import content_types, graph, prompting, retrieval, voice
 
 # 按形态给总预算（字符）——仅作为 YAML 缺失时的兜底
 BUDGET = {"article": 18000, "novel": 28000}
@@ -41,8 +41,11 @@ TASK_BUCKETS = {
 BUCKET_BUDGET = {
     "S0": 1500,
     # 1200 装得下文体要求与逐篇设定，装不下文风画像（约 150-600 字）；
-    # 被截掉的是尾部那句「禁忌」，等于作者最在意的约束先没了
-    "S1": 2000,
+    # 被截掉的是尾部那句「禁忌」，等于作者最在意的约束先没了。
+    # 2600 是给小说的去 AI 味负面清单留的位置（约 250 字，见 content-types.yaml）：
+    # 拼装顺序是 base → rules → type_style → 渠道 → 画像 → style_json，
+    # _head 截尾部，最坏情况下先丢 style_json 再丢画像——两头都是不能丢的。
+    "S1": 2600,
     "S2": 4000,
     "S3": 2000,
     "S4": 3000,
@@ -192,9 +195,12 @@ async def _source_evidence(
         return "", [], [], ""
 
     used: list[dict[str, Any]] = []
-    query = retrieval.build_query(
-        (node or {}).get("title"), instruction, work.get("premise")
+    # 用节点计划里的关键词检索，而不是整段 instruction：模板句会把
+    # 真正的资料名挤出去（见 prompting.retrieval_terms）。
+    terms = prompting.retrieval_terms(
+        node or {}, prompting.work_meta(work), extra=instruction
     )
+    query = retrieval.build_query(*terms, work.get("premise"))
     if query and await store.count_chunks(work_id, "source"):
         hits = await retrieval.retrieve(
             store,
@@ -270,6 +276,39 @@ async def _source_evidence(
     return "\n\n---\n\n".join(chunks), used, warnings, "recent" if chunks else "empty"
 
 
+async def _voice_from_book(store, work: dict, node: Optional[dict]) -> str:
+    """画像的空档兜底：用本书已写的章节现算一版。
+
+    新书没贴过旧文，S1 里就完全没有「怎么写」的约束——而文风画像本该在
+    最需要的时候在场。`voice.analyze` 是纯本地统计，一次调用都不用花。
+
+    取本节之前、离本节**最近**的几节：文案承诺的是「保持前后一致」，
+    拿开篇前五章算则恰好相反——写到第 200 章时，开篇的句长只说明当年怎么写。
+    正在写的那一节是半成品，混进样本会把统计拉歪，所以整段跳过。
+
+    只返回画像本身，开场白由调用方给：兜底的画像可能是 AI 写的，必须
+    标明「这不是模仿目标」，而那句话不属于画像。
+    """
+    current = int((node or {}).get("ordinal") or 0)
+    try:
+        items = await store.list_readable(work["id"])
+    except Exception:  # noqa: BLE001 - 画像是锦上添花，读不到就跳过
+        return ""
+    # chars 是 SQL 里的 length(content)，先用它筛掉短的，省掉一次 get_node
+    before = [n for n in items
+              if (not current or int(n.get("ordinal") or 0) < current)
+              and int(n.get("chars") or 0) >= 300]
+    texts: list[str] = []
+    for item in before[-5:]:
+        full = await store.get_node(item["id"])
+        body = (full or {}).get("content") or ""
+        if len(body) >= 300:
+            texts.append(body)
+    if not texts:
+        return ""
+    return voice.build(texts, noun="节正文")
+
+
 async def assemble(
     store,
     work: dict,
@@ -328,12 +367,23 @@ async def assemble(
 
     # ---------- S1 写作规范 ----------
     # 文风画像在 S1 而不是 S5：它是「怎么写」，不是「写什么」。
-    # 没贴过旧文时是空串，这一段完全不出现。
-    voice = ""
+    # 两种来源的语义相反，开场白必须分开写：用户贴的旧文是「照这个写」，
+    # 用本书兜底算出来的是「现状描述」——后者可能是 AI 写的，说成模仿
+    # 目标就会把一个已经跑偏的基线越推越远。
+    voice_text = ""
+    voice_intro = ""
     if "S1" in buckets:
         getter = getattr(store, "get_setting", None)
         if getter is not None:
-            voice = await getter("voice_profile")
+            voice_text = await getter("voice_profile")
+        if voice_text:
+            voice_intro = "按作者自己的文风写（下面的数字来自他发表过的文章，不是泛泛的形容词）："
+        else:
+            voice_text = await _voice_from_book(store, work, node)
+            # 开场白只能在这里给：`_voice_from_book` 不知道自己是兜底还是
+            # 用户贴的旧文，说错一句就把「基线」变成「模仿目标」。
+            voice_intro = ("下面是本书已写章节的文风基线（不是模仿目标，"
+                           "只用来保持前后一致；与你想要的文风不符时以你的要求为准）：")
     if "S1" in buckets:
         style = _style_text(work)
         base = "你是专业的中文写作助手。只输出正文内容，不要解释你的写作过程。"
@@ -358,9 +408,8 @@ async def assemble(
         if plat:
             label = resolved.get("channel_label") or "当前渠道"
             text += f"\n平台要求（{label}）：\n" + plat
-        if voice:
-            text += ("\n按作者自己的文风写（下面的数字来自他发表过的文章，不是泛泛的形容词）：\n"
-                     + voice)
+        if voice_text:
+            text += "\n" + voice_intro + voice_text
         if style:
             text += "\n" + style
         buckets["S1"].text, cut = _head(text, buckets["S1"].budget)
@@ -468,8 +517,14 @@ async def assemble(
             buckets.pop("S6", None)
         else:
             current_ordinal = int((node or {}).get("ordinal") or 0)
-            probe = " ".join(x for x in (
-                (node or {}).get("title"), instruction, work.get("premise")) if x)
+            # 探针与 S5 同一套取词：都只靠「标题 + 地点 + 要点」，
+            # 不再把整段指令模板拼进去——那会把图谱里的专名淹掉。
+            # 主旨另拼：那不是「本节计划」，但整本的世界观都压在它身上
+            probe = " ".join([
+                *prompting.retrieval_terms(
+                    node or {}, prompting.work_meta(work), extra=instruction),
+                work.get("premise") or "",
+            ]).strip()
             sg = await graph.subgraph(
                 store, work["id"], text=probe, hops=2, limit=40)
             text = graph.format_subgraph(
@@ -528,7 +583,12 @@ async def assemble(
     if "S5" in buckets and node:
         used = sum(b.chars for bid, b in buckets.items() if bid != "S5")
         room = max(1200, min(buckets["S5"].budget, total_budget - used))
-        query = retrieval.build_query(node.get("title"), instruction, work.get("premise"))
+        query = retrieval.build_query(
+            *prompting.retrieval_terms(node, prompting.work_meta(work), extra=instruction),
+            work.get("premise"),
+        )
+        # 地点/标题整串命中比散词命中硬：传下去做短语加成（见 retrieval.PHRASE_BONUS）
+        phrases = prompting.retrieval_phrases(node, prompting.work_meta(work))
         hits = await retrieval.retrieve(
             store,
             work["id"],
@@ -538,6 +598,7 @@ async def assemble(
             top_k=8,
             budget_chars=room,
             exclude_node_ids={node["id"]},
+            phrases=phrases,
         )
         if hits:
             buckets["S5"].budget = room

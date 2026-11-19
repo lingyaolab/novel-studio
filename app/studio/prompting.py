@@ -10,9 +10,10 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
-from app.studio import jsonutil
+from app.studio import jsonutil, tokenize
 
 
 def work_meta(work: dict[str, Any]) -> dict[str, Any]:
@@ -102,6 +103,70 @@ def node_instruction(node: dict[str, Any], meta: dict[str, Any], extra: str = ""
         bits.append(f"附加要求：{extra}")
     bits.append("只输出本节正文，不要重复标题，不要写下一节的过渡句。")
     return "\n".join(bits)
+
+
+# 标题里的卷/章序号不是检索线索：「第一章 夜访」里的「第一章」全库都有。
+# 分词前先在原文里抠一遍：jieba 会把「第一章」切成「第一」「章」，
+# 事后按 token 过滤只能拦住后者。
+_ORDINAL_IN_TEXT = re.compile(r"第\s*[0-9一二三四五六七八九十百千零两]{1,4}\s*[章节卷回部篇讲]")
+_ORDINAL = re.compile(r"^第[0-9一二三四五六七八九十百千零两]{1,4}[章节卷回部篇讲]$")
+
+
+def retrieval_terms(
+    node: dict[str, Any], meta: dict[str, Any], *, extra: str = ""
+) -> list[str]:
+    """本节检索用的关键词，按重要度排序。
+
+    不能把 `node_instruction()` 整段拿去分词：它一半篇幅是模板句
+    （「本节标题」「篇幅：约 1000 字」「只输出本节正文」）。实测一节 123 个词，
+    `match_query` 只取前 12 个，其中一半是套话，而计划里真正的地名/器物
+    （「西市」「暗格」「令底」）全被挡在门外——检索不是没召回，是根本没问出去。
+
+    取词顺序就是重要度：标题 → 地点/时间 → 要点 → 节拍卡 → 附加要求。
+    “地点/时间”排在“要点”前面：它们是作者点名的最硬线索，而要点常是长句。
+    """
+    node = node or {}
+    info = node_outline(node, meta)
+    raw: list[str] = []
+    if node.get("title"):
+        raw.append(_ORDINAL_IN_TEXT.sub(" ", str(node["title"])))
+    for key in ("place", "time"):
+        if info.get(key):
+            raw.append(str(info[key]))
+    if info.get("prompt"):
+        raw.append(str(info["prompt"]))
+    beat = str(node.get("summary") or "").strip()
+    if beat:
+        raw.append(beat)
+    if extra:
+        raw.append(str(extra))
+
+    out: list[str] = []
+    for tok in tokenize.tokens(" ".join(raw)):
+        if tok in out or tok.isdigit() or _ORDINAL.match(tok):
+            continue
+        out.append(tok)
+    return out
+
+
+def retrieval_phrases(node: dict[str, Any], meta: dict[str, Any]) -> list[str]:
+    """检索里当「短语」用的短串：去掉序号后的标题 + 地点。
+
+    长句在 FTS 里不可能连续命中，但「西市仓库」这种 3-4 字的地名一旦在正文里
+    原文出现，就是比散词命中硬得多的证据。`retrieve` 会对候选块做子串匹配并加成。
+    """
+    node = node or {}
+    info = node_outline(node, meta)
+    out: list[str] = []
+    for raw in (
+        _ORDINAL_IN_TEXT.sub(" ", str(node.get("title") or "")),
+        str(info.get("place") or ""),
+    ):
+        p = raw.strip().strip("《》〈〉\"'“” ")
+        # 短于 3 字（「夜访」）太容易误中；带空白说明不是一个连续串
+        if len(p) >= 3 and p not in out and " " not in p:
+            out.append(p)
+    return out
 
 
 def target_words_of(node: dict[str, Any], meta: dict[str, Any], resolved: dict[str, Any]) -> int:
@@ -210,4 +275,56 @@ def parse_facts(text: str) -> list[dict[str, str]]:
         out.append({"statement": statement, "valid_until": valid})
         if len(out) >= 10:
             break
+    return out
+
+
+# ==================== 去 AI 味改写（tasks.run_deai） ====================
+
+# 三条硬要求是针对三种最常见的坏结果：改情节、改对白的意思、把一段拆成三段。
+# 拆段最隐蔽——贴回时找不到原段，整节的段落编号会错位，
+# 而「逐段替换」正是靠段号对齐的。
+DEAI_SYSTEM = (
+    "你是中文小说的文字编辑。下面给你一节正文里的若干段落，每段用【段号】标出。"
+    "这些段落有具体的行文问题，你要逐段改写。\n"
+    "硬性要求：只改句式与用词，不改情节、不改人物说的话的意思、不改段落顺序；"
+    "不增加也不删除信息；每一段改写后仍然是一整段。\n"
+    "输出格式（只输出段号和正文，不要任何解释）：\n"
+    "【5】\n改写后的这一段\n【9】\n改写后的这一段"
+)
+
+# 回复里可能有代码块、多余空行、甚至把段号写成「第 5 段」
+_DEAI_PIECE = re.compile(r"【(\d+)】\s*\n(.*?)(?=\n*【\d+】|\Z)", re.S)
+
+
+def deai_prompt(
+    paras: list[tuple[int, str]], hits: list[dict], requirements: str = ""
+) -> tuple[str, str]:
+    """组装去 AI 味改写的 (system, user)。
+
+    `paras` 要改的段落 [(段号, 原文)]，`hits` 是 aivoice 的命中清单。
+    `requirements` 是文种要求：改写时「文体要求」仍然有效——不带它，
+    模型会把小说段改得和通稿一样平，AI 味换了种而已。
+    """
+    system = DEAI_SYSTEM
+    if (requirements or "").strip():
+        system += "\n\n" + requirements.strip()
+
+    blocks = [f"【{idx}】\n{para}" for idx, para in paras]
+    problems: list[str] = []
+    for hit in hits:
+        loc = str(hit.get("location") or "").strip()
+        where = f"第 {loc} 段" if loc else "本节"
+        problems.append(f"- {where}：{hit.get('message') or ''}")
+    user = ("要改的段落原文：\n" + "\n\n".join(blocks)
+            + "\n\n问题清单：\n" + "\n".join(problems))
+    return system, user
+
+
+def parse_deai(text: str) -> dict[int, str]:
+    """把「【段号】\n正文」的回复拆成 {段号: 正文}。"""
+    out: dict[int, str] = {}
+    for m in _DEAI_PIECE.finditer(text or ""):
+        body = m.group(2).strip()
+        if body:
+            out[int(m.group(1))] = body
     return out

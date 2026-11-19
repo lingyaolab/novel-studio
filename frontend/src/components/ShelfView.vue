@@ -1,5 +1,5 @@
 <template>
-  <main ref="shelfEl" class="shelf">
+  <main id="main" tabindex="-1" ref="shelfEl" class="shelf">
     <header class="shelf-head">
       <div>
         <h1>写作台</h1>

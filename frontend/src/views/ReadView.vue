@@ -39,7 +39,7 @@
         </template>
       </nav>
 
-      <main ref="docEl" class="doc">
+      <main id="main" tabindex="-1" ref="docEl" class="doc">
         <p v-if="loading" class="empty">正在把全书按阅读顺序拼起来…</p>
         <p v-else-if="!sections.length" class="empty">
           还没有能读的内容：先写几节，或点「逐节生成」。

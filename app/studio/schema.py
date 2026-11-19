@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS node_versions (
     node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
     version_no INTEGER NOT NULL,
     content TEXT NOT NULL,
-    source TEXT NOT NULL,             -- ai_draft / ai_polish / human
+    source TEXT NOT NULL,             -- ai_draft / ai_polish / ai_deai / human / bulk_replace
     run_id TEXT,
     created_at REAL NOT NULL,
     UNIQUE(node_id, version_no)
@@ -312,6 +312,17 @@ CREATE TABLE IF NOT EXISTS summaries (
     model TEXT DEFAULT '',
     created_at REAL NOT NULL,
     UNIQUE(scope, ref_id)
+);
+
+-- 摘要的 FTS：S5 的第二路召回落在这张表上（找回「第 30 章埋的伏笔」这类
+-- 距今很远的证据，最近几节已经被 S4 直接注入过了）。
+-- text_tok 与 chunks_fts 同一套 jieba 预分词；写入由 store.upsert_summary 负责，
+-- 老库里已有的摘要靠 indexer.reindex_work 回填一次。
+CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts USING fts5(
+    summary_id UNINDEXED,
+    work_id UNINDEXED,
+    text_tok,
+    tokenize = 'unicode61'
 );
 
 -- ============ 手艺拆解（结构卡片） ============

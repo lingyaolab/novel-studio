@@ -48,6 +48,7 @@ from app.studio.jsonutil import as_list as _as_list
 from app.studio.jsonutil import parse_json_loose as _parse_json_loose
 from app.studio.prompting import node_instruction as _node_instruction
 from app.studio.store import BACKUP_SNAPSHOT_KEEP, BackupError, BUNDLE_FORMAT, LIBRARY_FORMAT
+from app.studio.text_import import parse_document
 
 router = APIRouter()
 
@@ -129,6 +130,19 @@ class NodeCreate(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     parent_id: Optional[str] = None
     content: str = ""
+
+
+class NodeBatchSection(BaseModel):
+    # 标题故意不在这里卡 min/max_length：整本导进来时，一节标题写长了
+    # 不该让 422 把整批（连带那些好节）一起顶回去，逐条判在 store 里做
+    title: str = ""
+    content: str = ""
+
+
+class NodeBatchCreate(BaseModel):
+    kind: Literal["volume", "chapter", "section"] = "chapter"
+    parent_id: Optional[str] = None
+    sections: list[NodeBatchSection] = Field(default_factory=list)
 
 
 class NodeUpdate(BaseModel):
@@ -556,7 +570,7 @@ _SNAPSHOT_FAILED = "快照没写成，详见服务端日志"
 # node_versions.source 的取值集合，与前端 SOURCE_LABEL 一一对应。
 # 放开成任意字符串的话，历史页会出现「未知」这种没人看得懂的行，回滚前不敢点。
 # `bulk_replace` 是「全作品替换」单独开的那一档：替换不是今天新写的字，不该刷高日历。
-_VERSION_SOURCES = {"human", "ai_draft", "ai_polish", "bulk_replace"}
+_VERSION_SOURCES = {"human", "ai_draft", "ai_polish", "ai_deai", "bulk_replace"}
 
 
 # ==================== 作品 ====================
@@ -903,6 +917,27 @@ async def create_node(work_id: str, body: NodeCreate, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/studio/works/{work_id}/nodes/batch", dependencies=[Depends(verify_key)])
+async def create_nodes_batch(work_id: str, body: NodeBatchCreate, request: Request):
+    """一次落一批同级节点（导入整本书用的）。
+
+    为什么不止前端那个循环：逐节 POST 时 2000 章要 39 秒，而且中途断掉只剩
+    半本书、界面只报一个失败数。这一条一个事务落完一批，path/ordinal 只起一次头。
+    结构性问题（类型不认、空批、一批过多）400 带一句人话；单节标题为空不拦整批，
+    落在返回的 `failed` 里（带下标与原因），由前端把哪几节没进来念给人听。
+    """
+    await _require_work(request, work_id)
+    try:
+        return await _store(request).create_nodes_batch(
+            work_id=work_id,
+            kind=body.kind,
+            parent_id=body.parent_id,
+            sections=[s.model_dump() for s in body.sections],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/studio/nodes/{node_id}", dependencies=[Depends(verify_key)])
 async def get_node(node_id: str, request: Request):
     node = await _store(request).get_node(node_id)
@@ -1203,11 +1238,30 @@ async def restore_backup_node(filename: str, request: Request):
     return out
 
 
-# ==================== DOCX 导入 ====================
+# ==================== 稿件导入 ====================
+
+@router.post("/studio/import/doc", dependencies=[Depends(verify_key)])
+async def import_doc(request: Request, name: str = ""):
+    """把 .docx / .epub / .txt / .md 解成纯文本（不写库）：一个口子接完所有稿件。
+
+    文本类也从后端走，不让浏览器 `file.text()` 自己读：那一句按 UTF-8 硬解，
+    Windows 上发过来的 GBK 中文稿会变成一路不报错的乱码，等落进库才发现
+    整本书废了。解出的文本回到导入弹层预览，落库仍走 `create_node` 老路。
+
+    收原始字节而不是 multipart：与 docx 同一理由——不想为单机内网接口
+    新增 python-multipart 依赖。文件名走 query（`?name=xxx.epub`），
+    没名字就嗅探内容。
+    """
+    data = await request.body()
+    try:
+        return parse_document(name or "", data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 @router.post("/studio/import/docx", dependencies=[Depends(verify_key)])
 async def import_docx(request: Request):
-    """把 .docx 解成纯文本（不写库）：前端拿去填进导入弹层，预览、拆节、落库都走老路。
+    """旧入口：只接 .docx。新前端统一走 /studio/import/doc，这一条给老调用方留着。
 
     收原始字节而不是 multipart：那样要新增 python-multipart 依赖，而这一份本来就是
     单机内网的小工具接口。解析只用标准库（见 `app.studio.docx_import`）。
@@ -1438,9 +1492,12 @@ async def preview_context(body: GenerateRequest, request: Request, work_id: str,
         store, work, node, body.task_type, instruction, template=template, resolved=resolved
     )
     payload = result.as_dict()
-    # 把「为什么引用了这几段」一并带上，调 prompt 时不用再去翻库
+    # 把「为什么引用了这几段」一并带上，调 prompt 时不用再去翻库。
+    # 取词与短语口径必须与装配器 S5 完全一致，否则预览看到的不是真发出去的那一份
+    meta = prompting.work_meta(work)
     query = retrieval.build_query(
-        node.get("title") if node else "", instruction, work.get("premise")
+        *prompting.retrieval_terms(node or {}, meta, extra=instruction),
+        work.get("premise"),
     )
     payload["query"] = query
     payload["evidence"] = await retrieval.retrieve(
@@ -1452,6 +1509,7 @@ async def preview_context(body: GenerateRequest, request: Request, work_id: str,
         top_k=8,
         budget_chars=3000,
         exclude_node_ids={node["id"]} if node else None,
+        phrases=prompting.retrieval_phrases(node or {}, meta),
     )
     return payload
 
@@ -2619,7 +2677,11 @@ async def publication_summary(request: Request):
 _TRANSFORM_ACTIONS: dict[str, tuple[str, str]] = {
     "rewrite": ("重写", "在不改变事实与结论的前提下重写这段文字，改善节奏、句长与衔接；不得新增事实。"),
     "condense": ("压缩", "把这段压缩到原文的 40%-60%，保留全部关键事实、数字与专有名词。"),
-    "expand": ("扩写", "把这段扩写到原文的 1.8-2.2 倍，补充细节、例子与过渡；不得虚构事实或数据。"),
+    # 「倍」这种相对说法模型经常偷懒成同长度改写（实测 1.05-1.22 倍），
+    # 所以路由里还会按原文算出具体目标字数，事后按实测字数复核一次
+    "expand": ("扩写", "把这段扩写到原文的 1.8-2.2 倍：补动作、环境、人物反应、例子与过渡；"
+                       "不得虚构事实或数据，但要把原文已有的信息真正展开。"
+                       "不要把原文换个说法就交回来。"),
     "polish": ("润色", "只做语言层面的修改：错别字、病句、重复、标点；不改事实、结构与顺序。"),
     "translate": ("翻译", "把这段译成目标语言，术语保持一致，保留原文的段落划分。"),
     "split": ("拆分", "把这段按语义拆成 2-4 个带小标题的段落，内容不增不减。"),
@@ -2665,6 +2727,17 @@ async def transform(body: TransformRequest, request: Request):
     if body.action == "translate":
         brief = brief.replace("目标语言", body.lang or "英文")
 
+    # 扩写/压缩不能只靠「1.8 倍」这种相对说法：模型会按原长度顺手改一遍。
+    # 把原文实际字数与目标区间算死，写进 task 与 system 两处。
+    src_chars = max(1, len(body.text.strip()))
+    expand_low, expand_high = round(src_chars * 1.8), round(src_chars * 2.2)
+    condense_low, condense_high = round(src_chars * 0.4), round(src_chars * 0.6)
+    if body.action == "expand":
+        brief += (f" 原文约 {src_chars} 字，这次要写到 {expand_low}-{expand_high} 字；"
+                  "字数不够就继续补细节、动作、环境与过渡，不要提前收尾。")
+    elif body.action == "condense":
+        brief += f" 原文约 {src_chars} 字，这次要压到 {condense_low}-{condense_high} 字。"
+
     store = _store(request)
     style = ""
     work = None
@@ -2684,6 +2757,12 @@ async def transform(body: TransformRequest, request: Request):
         system = "你是公众号编辑。只输出标题，一行一个，不编号、不加书名号、不解释。"
     else:
         system = "你是中文编辑，只输出加工后的正文，不解释、不加前后缀。"
+    if body.action == "expand":
+        system += (f"\n<length> 必须扩写：原文 {src_chars} 字，输出 "
+                   f"{expand_low}-{expand_high} 字；达不到就继续展开，不要提前收尾。")
+    elif body.action == "condense":
+        system += (f"\n<length> 必须压缩：原文 {src_chars} 字，输出 "
+                   f"{condense_low}-{condense_high} 字。")
     if style:
         system += "\n" + style
     user_parts = [f"<task>{brief}</task>"]
@@ -2709,33 +2788,59 @@ async def transform(body: TransformRequest, request: Request):
     results: list[dict[str, Any]] = []
     errors: list[str] = []
     for i, m in targets:
-        run_id = await store.start_run(
-            work_id=body.work_id or "transform",
-            node_id=None,
-            task_type=f"transform:{body.action}",
-            model=m,
-            provider=gateway.resolve(m)[0],
-            prompt_chars=len(system) + len(user),
-            variant=i,
-        )
-        started = time.perf_counter()
-        try:
-            res = await gateway.complete(model=m, system=system, prompt=user, mode=body.mode or "quick")
-        except Exception as exc:  # noqa: BLE001
+        prompt = user
+        attempt = 0
+        prev = None  # 补写前那一稿：第二稿更短时宁可退回它，不拿更差的换掉
+        while True:
+            attempt += 1
+            run_id = await store.start_run(
+                work_id=body.work_id or "transform",
+                node_id=None,
+                task_type=f"transform:{body.action}",
+                model=m,
+                provider=gateway.resolve(m)[0],
+                prompt_chars=len(system) + len(prompt),
+                variant=i,
+            )
+            started = time.perf_counter()
+            try:
+                res = await gateway.complete(model=m, system=system, prompt=prompt,
+                                             mode=body.mode or "quick")
+            except Exception as exc:  # noqa: BLE001
+                elapsed = int((time.perf_counter() - started) * 1000)
+                await store.finish_run(run_id, status="failed", error=str(exc), elapsed_ms=elapsed)
+                errors.append(f"候选 {i + 1}（{m}）失败：{exc}")
+                break
             elapsed = int((time.perf_counter() - started) * 1000)
-            await store.finish_run(run_id, status="failed", error=str(exc), elapsed_ms=elapsed)
-            errors.append(f"候选 {i + 1}（{m}）失败：{exc}")
-            continue
-        elapsed = int((time.perf_counter() - started) * 1000)
-        await store.finish_run(run_id, status="ok", output_chars=len(res.text), elapsed_ms=elapsed)
-        results.append({
-            "variant": i,
-            "run_id": run_id,
-            "model": m,
-            "text": res.text.strip(),
-            "chars": len(res.text.strip()),
-            "elapsed_ms": elapsed,
-        })
+            text = res.text.strip()
+            await store.finish_run(run_id, status="ok", output_chars=len(text), elapsed_ms=elapsed)
+
+            # 扩写实测最常翻车的地方：模型只做同长度改写。低于 1.5 倍就带着
+            # 实测字数再要一稿；两次都记 runs（钱确实花了），只把后一稿交出去。
+            if (body.action == "expand" and attempt == 1
+                    and len(text) < src_chars * 1.5):
+                prev = {"run_id": run_id, "text": text, "elapsed_ms": elapsed}
+                prompt = user + (
+                    f"\n\n<feedback>上一稿只有 {len(text)} 字（约原文的 "
+                    f"{len(text) / src_chars:.1f} 倍），不够。这次必须写到 "
+                    f"{expand_low}-{expand_high} 字：把细节、动作、环境、人物反应"
+                    "和过渡补足，不要只做同长度改写。</feedback>"
+                )
+                logger.info(f"[studio] 扩写只到 {len(text)}/{src_chars} 字，带反馈重试一次（{m}）")
+                continue
+
+            if prev is not None and len(text) < len(prev["text"]):
+                run_id, text, elapsed = prev["run_id"], prev["text"], prev["elapsed_ms"]
+
+            results.append({
+                "variant": i,
+                "run_id": run_id,
+                "model": m,
+                "text": text,
+                "chars": len(text),
+                "elapsed_ms": elapsed,
+            })
+            break
 
     if not results:
         raise HTTPException(status_code=502, detail={"message": "全部候选都失败了", "errors": errors})
@@ -3217,7 +3322,7 @@ async def issues_summary(work_id: str, request: Request):
 # ==================== 任务队列（M4） ====================
 
 class BatchRequest(BaseModel):
-    task_type: Literal["draft", "beats", "polish", "check", "summarize", "extract"] = "draft"
+    task_type: Literal["draft", "beats", "polish", "deai", "check", "summarize", "extract"] = "draft"
     node_ids: list[str] = Field(default_factory=list)  # 空 = 按 only_empty 选
     only_empty: bool = True
     limit: int = 0            # 0 = 不限
@@ -3253,7 +3358,7 @@ async def enqueue_batch(work_id: str, body: BatchRequest, request: Request):
         raise HTTPException(status_code=503, detail="任务队列未启动")
 
     is_novel = (work.get("kind") or "article") == "novel"
-    if body.task_type in ("extract", "beats") and not is_novel:
+    if body.task_type in ("extract", "beats", "deai") and not is_novel:
         raise HTTPException(status_code=400, detail="该任务只用于小说")
 
     # 选节点：指定优先，否则按「有没有正文」筛
@@ -3272,7 +3377,7 @@ async def enqueue_batch(work_id: str, body: BatchRequest, request: Request):
             has_text = bool((node.get("content") or "").strip())
             if body.only_empty and has_text:
                 continue
-            if body.task_type in ("polish", "check", "extract", "summarize") and not has_text:
+            if body.task_type in ("polish", "deai", "check", "extract", "summarize") and not has_text:
                 continue
             nodes.append(node)
     nodes.sort(key=lambda n: int(n.get("ordinal") or 0))
@@ -3284,7 +3389,8 @@ async def enqueue_batch(work_id: str, body: BatchRequest, request: Request):
     # 预算闸门：凡是要调模型的任务类型都估都拦——beats/polish/extract 这些
     # 单笔比写正文小，但走的也是计钱通道，积起来一样烧预算（审查 m14）。
     # check 是纯本地规则不花钱，不在名单里。
-    if body.task_type in ("draft", "article_draft", "beats", "polish", "extract", "summarize"):
+    if body.task_type in ("draft", "article_draft", "beats", "polish", "deai",
+                          "extract", "summarize"):
         model = pick_model(request.app.state.registry, body.model or None)
         est = await cost.estimate_pipeline(
             store, request.app.state.registry, work_id=work_id,
