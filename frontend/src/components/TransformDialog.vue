@@ -125,6 +125,9 @@
             <header class="cand-head">
               <span class="cand-tag">候选 {{ r.variant + 1 }}</span>
               <span v-if="r.model" class="cand-model">{{ shortModel(r.model) }}</span>
+              <span v-if="lengthAction" class="cand-ratio" :class="{ 'is-off': !ratioOk(r) }">
+                ×{{ ratioOf(r) }}
+              </span>
               <span class="cand-meta">{{ r.chars }} 字 · {{ (r.elapsed_ms / 1000).toFixed(1) }}s</span>
             </header>
             <!-- 起标题要的是「挑一个」，把五行整块贴回正文没有意义：按行拆开点 -->
@@ -193,6 +196,9 @@ const mixPick = ref([])
 
 const results = computed(() => store.transformResult?.candidates || [])
 const srcChars = computed(() => text.value.length)
+// 倍数看的是「这批结果是什么动作跑出来的」：跑完再改动作，旧结果的倍数不该换算法
+const resultAction = computed(() => store.transformResult?.action || '')
+const lengthAction = computed(() => resultAction.value === 'expand' || resultAction.value === 'condense')
 const hasSelection = computed(() => props.selection.trim().length > 0)
 const titleMode = computed(() => action.value === 'title')
 const fullText = computed(() => (props.text || '').slice(0, 20000))
@@ -229,6 +235,16 @@ function toggleCompare(id) {
 
 function useSelection() {
   if (props.selection) text.value = props.selection.slice(0, 20000)
+}
+
+/** 扩写/压缩的实测倍数：模型偷懒成同长度改写时，卡片上直接看得见 */
+function ratioOf(r) {
+  return (r.chars / Math.max(1, srcChars.value)).toFixed(2)
+}
+
+function ratioOk(r) {
+  const x = r.chars / Math.max(1, srcChars.value)
+  return resultAction.value === 'expand' ? x >= 1.5 : x <= 0.7
 }
 
 function close() {
@@ -705,5 +721,13 @@ async function copy(t) {
   border-radius: 999px;
   font-size: 10.5px;
   color: var(--text-muted);
+}
+.cand-ratio {
+  font-family: theme('fontFamily.mono');
+  font-size: 10.5px;
+  color: var(--run);
+}
+.cand-ratio.is-off {
+  color: var(--warn);
 }
 </style>

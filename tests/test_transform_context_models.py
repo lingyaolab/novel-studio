@@ -178,3 +178,69 @@ def test_one_model_failing_keeps_others(tmp_path):
     assert len(body["candidates"]) == 1
     assert body["candidates"][0]["model"] == "gpt-good"
     assert any("gpt-bad" in e for e in body["errors"])
+
+
+# ==================== 扩写：字数契约与补写重试 ====================
+
+SRC_100 = "字" * 100
+
+
+class SeqGateway(FakeGateway):
+    """按调用顺序返回准备好的稿子，用来复现「第一稿没写到目标字数」。"""
+
+    def __init__(self, registry, replies):
+        super().__init__(registry)
+        self._replies = list(replies)
+
+    async def complete(self, *, model, system, prompt, mode):
+        self.calls.append({"model": model, "system": system, "prompt": prompt})
+        text = self._replies.pop(0) if len(self._replies) > 1 else self._replies[0]
+        return SimpleNamespace(text=text)
+
+
+def _client_with(tmp_path, gw, reg):
+    return TestClient(_make_app(tmp_path, gw, reg))
+
+
+def test_expand_carries_concrete_char_range(tmp_path):
+    """「1.8-2.2 倍」太虚：必须按原文算出 180-220 字，system 里也要有硬约束。"""
+    reg = make_registry(compat_cfg())
+    gw = SeqGateway(reg, ["字" * 190])
+    with _client_with(tmp_path, gw, reg) as c:
+        r = c.post("/studio/transform", json={"text": SRC_100, "action": "expand"})
+    assert r.status_code == 200, r.text
+    call = gw.calls[0]
+    assert "原文约 100 字" in call["prompt"]
+    assert "180-220 字" in call["prompt"]
+    assert "<length>" in call["system"] and "180-220 字" in call["system"]
+
+
+def test_expand_retries_once_when_model_keeps_the_length(tmp_path):
+    """实测模型会只改几个词（1.05-1.22 倍）：不足 1.5 倍就带实测字数再要一稿。"""
+    reg = make_registry(compat_cfg())
+    gw = SeqGateway(reg, ["字" * 120, "字" * 190])
+    with _client_with(tmp_path, gw, reg) as c:
+        r = c.post("/studio/transform", json={"text": SRC_100, "action": "expand"})
+    body = r.json()
+    assert len(gw.calls) == 2
+    assert "上一稿只有 120 字" in gw.calls[1]["prompt"]
+    assert "180-220 字" in gw.calls[1]["prompt"]
+    # 交出去的是补写后的第二稿
+    assert body["candidates"][0]["chars"] == 190
+
+
+def test_expand_does_not_retry_when_the_first_draft_is_long_enough(tmp_path):
+    reg = make_registry(compat_cfg())
+    gw = SeqGateway(reg, ["字" * 190, "字" * 190])
+    with _client_with(tmp_path, gw, reg) as c:
+        c.post("/studio/transform", json={"text": SRC_100, "action": "expand"})
+    assert len(gw.calls) == 1
+
+
+def test_expand_keeps_the_longer_draft_when_retry_is_shorter(tmp_path):
+    """补写也可能更差：第二稿比第一稿还短就退回第一稿，不拿更差的换掉。"""
+    reg = make_registry(compat_cfg())
+    gw = SeqGateway(reg, ["字" * 120, "字" * 100])
+    with _client_with(tmp_path, gw, reg) as c:
+        r = c.post("/studio/transform", json={"text": SRC_100, "action": "expand"})
+    assert r.json()["candidates"][0]["chars"] == 120

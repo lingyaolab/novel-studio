@@ -2677,7 +2677,11 @@ async def publication_summary(request: Request):
 _TRANSFORM_ACTIONS: dict[str, tuple[str, str]] = {
     "rewrite": ("重写", "在不改变事实与结论的前提下重写这段文字，改善节奏、句长与衔接；不得新增事实。"),
     "condense": ("压缩", "把这段压缩到原文的 40%-60%，保留全部关键事实、数字与专有名词。"),
-    "expand": ("扩写", "把这段扩写到原文的 1.8-2.2 倍，补充细节、例子与过渡；不得虚构事实或数据。"),
+    # 「倍」这种相对说法模型经常偷懒成同长度改写（实测 1.05-1.22 倍），
+    # 所以路由里还会按原文算出具体目标字数，事后按实测字数复核一次
+    "expand": ("扩写", "把这段扩写到原文的 1.8-2.2 倍：补动作、环境、人物反应、例子与过渡；"
+                       "不得虚构事实或数据，但要把原文已有的信息真正展开。"
+                       "不要把原文换个说法就交回来。"),
     "polish": ("润色", "只做语言层面的修改：错别字、病句、重复、标点；不改事实、结构与顺序。"),
     "translate": ("翻译", "把这段译成目标语言，术语保持一致，保留原文的段落划分。"),
     "split": ("拆分", "把这段按语义拆成 2-4 个带小标题的段落，内容不增不减。"),
@@ -2723,6 +2727,17 @@ async def transform(body: TransformRequest, request: Request):
     if body.action == "translate":
         brief = brief.replace("目标语言", body.lang or "英文")
 
+    # 扩写/压缩不能只靠「1.8 倍」这种相对说法：模型会按原长度顺手改一遍。
+    # 把原文实际字数与目标区间算死，写进 task 与 system 两处。
+    src_chars = max(1, len(body.text.strip()))
+    expand_low, expand_high = round(src_chars * 1.8), round(src_chars * 2.2)
+    condense_low, condense_high = round(src_chars * 0.4), round(src_chars * 0.6)
+    if body.action == "expand":
+        brief += (f" 原文约 {src_chars} 字，这次要写到 {expand_low}-{expand_high} 字；"
+                  "字数不够就继续补细节、动作、环境与过渡，不要提前收尾。")
+    elif body.action == "condense":
+        brief += f" 原文约 {src_chars} 字，这次要压到 {condense_low}-{condense_high} 字。"
+
     store = _store(request)
     style = ""
     work = None
@@ -2742,6 +2757,12 @@ async def transform(body: TransformRequest, request: Request):
         system = "你是公众号编辑。只输出标题，一行一个，不编号、不加书名号、不解释。"
     else:
         system = "你是中文编辑，只输出加工后的正文，不解释、不加前后缀。"
+    if body.action == "expand":
+        system += (f"\n<length> 必须扩写：原文 {src_chars} 字，输出 "
+                   f"{expand_low}-{expand_high} 字；达不到就继续展开，不要提前收尾。")
+    elif body.action == "condense":
+        system += (f"\n<length> 必须压缩：原文 {src_chars} 字，输出 "
+                   f"{condense_low}-{condense_high} 字。")
     if style:
         system += "\n" + style
     user_parts = [f"<task>{brief}</task>"]
@@ -2767,33 +2788,59 @@ async def transform(body: TransformRequest, request: Request):
     results: list[dict[str, Any]] = []
     errors: list[str] = []
     for i, m in targets:
-        run_id = await store.start_run(
-            work_id=body.work_id or "transform",
-            node_id=None,
-            task_type=f"transform:{body.action}",
-            model=m,
-            provider=gateway.resolve(m)[0],
-            prompt_chars=len(system) + len(user),
-            variant=i,
-        )
-        started = time.perf_counter()
-        try:
-            res = await gateway.complete(model=m, system=system, prompt=user, mode=body.mode or "quick")
-        except Exception as exc:  # noqa: BLE001
+        prompt = user
+        attempt = 0
+        prev = None  # 补写前那一稿：第二稿更短时宁可退回它，不拿更差的换掉
+        while True:
+            attempt += 1
+            run_id = await store.start_run(
+                work_id=body.work_id or "transform",
+                node_id=None,
+                task_type=f"transform:{body.action}",
+                model=m,
+                provider=gateway.resolve(m)[0],
+                prompt_chars=len(system) + len(prompt),
+                variant=i,
+            )
+            started = time.perf_counter()
+            try:
+                res = await gateway.complete(model=m, system=system, prompt=prompt,
+                                             mode=body.mode or "quick")
+            except Exception as exc:  # noqa: BLE001
+                elapsed = int((time.perf_counter() - started) * 1000)
+                await store.finish_run(run_id, status="failed", error=str(exc), elapsed_ms=elapsed)
+                errors.append(f"候选 {i + 1}（{m}）失败：{exc}")
+                break
             elapsed = int((time.perf_counter() - started) * 1000)
-            await store.finish_run(run_id, status="failed", error=str(exc), elapsed_ms=elapsed)
-            errors.append(f"候选 {i + 1}（{m}）失败：{exc}")
-            continue
-        elapsed = int((time.perf_counter() - started) * 1000)
-        await store.finish_run(run_id, status="ok", output_chars=len(res.text), elapsed_ms=elapsed)
-        results.append({
-            "variant": i,
-            "run_id": run_id,
-            "model": m,
-            "text": res.text.strip(),
-            "chars": len(res.text.strip()),
-            "elapsed_ms": elapsed,
-        })
+            text = res.text.strip()
+            await store.finish_run(run_id, status="ok", output_chars=len(text), elapsed_ms=elapsed)
+
+            # 扩写实测最常翻车的地方：模型只做同长度改写。低于 1.5 倍就带着
+            # 实测字数再要一稿；两次都记 runs（钱确实花了），只把后一稿交出去。
+            if (body.action == "expand" and attempt == 1
+                    and len(text) < src_chars * 1.5):
+                prev = {"run_id": run_id, "text": text, "elapsed_ms": elapsed}
+                prompt = user + (
+                    f"\n\n<feedback>上一稿只有 {len(text)} 字（约原文的 "
+                    f"{len(text) / src_chars:.1f} 倍），不够。这次必须写到 "
+                    f"{expand_low}-{expand_high} 字：把细节、动作、环境、人物反应"
+                    "和过渡补足，不要只做同长度改写。</feedback>"
+                )
+                logger.info(f"[studio] 扩写只到 {len(text)}/{src_chars} 字，带反馈重试一次（{m}）")
+                continue
+
+            if prev is not None and len(text) < len(prev["text"]):
+                run_id, text, elapsed = prev["run_id"], prev["text"], prev["elapsed_ms"]
+
+            results.append({
+                "variant": i,
+                "run_id": run_id,
+                "model": m,
+                "text": text,
+                "chars": len(text),
+                "elapsed_ms": elapsed,
+            })
+            break
 
     if not results:
         raise HTTPException(status_code=502, detail={"message": "全部候选都失败了", "errors": errors})
