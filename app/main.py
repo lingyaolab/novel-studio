@@ -194,7 +194,13 @@ if FRONTEND_DIST.exists():
             raise HTTPException(status_code=404, detail="Not Found")
         index = FRONTEND_DIST / "index.html"
         if index.exists():
-            return FileResponse(str(index))
+            # 入口页每次回源：桌面壳用的是持久化 WebView2 profile，一旦把旧
+            # index.html 缓存住，重新构建前端后窗口里仍是旧 hash 的 assets——
+            # 现象就是「代码明明改了，打开桌面版还是老界面」。
+            # /assets 下的文件名自带 hash，不需要跟着改。
+            return FileResponse(
+                str(index), headers={"Cache-Control": "no-store, must-revalidate"}
+            )
         return {"error": "Frontend not built"}
 
 elif _WEB_DIR.exists():
