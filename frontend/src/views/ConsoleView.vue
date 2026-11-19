@@ -1,7 +1,7 @@
 <template>
   <div class="app-shell">
     <AppNav />
-    <main id="main" class="console-main">
+    <main id="main" tabindex="-1" class="console-main">
       <header class="console-header">
         <div class="title-block">
           <h1>控制台</h1>

@@ -44,7 +44,7 @@
           @batch="onBatch"
         />
 
-        <main class="editor" :style="writerVars">
+        <main id="main" tabindex="-1" class="editor" :style="writerVars">
           <header class="ed-top">
             <button class="icon-btn" title="返回书架" @click="backToShelf">
               <AppIcon name="library" :size="16" />

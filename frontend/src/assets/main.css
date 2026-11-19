@@ -490,8 +490,13 @@
     transform: translateY(-200%);
     transition: transform 0.2s var(--ease);
   }
-  .skip-link:focus {
+  /* 只给键盘用户看：鼠标点完/程序聚焦不该在导航上永久挂一个大按钮 */
+  .skip-link:focus-visible {
     transform: translateY(0);
+  }
+  /* 跳转落点不需要整块描一圈焦点框，滚动位置已经说明到了哪 */
+  main#main:focus {
+    outline: none;
   }
   .toolbar {
     @apply flex flex-wrap items-center gap-2;
