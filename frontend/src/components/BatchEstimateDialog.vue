@@ -292,7 +292,34 @@ function confirm() {
   color: var(--text-faint);
 }
 .input {
-  width: 140px;
+  width: 150px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control, 8px);
+  background: var(--canvas);
+  color: var(--text);
+  font-family: theme('fontFamily.mono');
+  font-size: 12.5px;
+  transition: border-color 0.18s var(--ease), background-color 0.18s var(--ease);
+}
+.input:hover {
+  border-color: var(--line-strong);
+}
+.input:focus {
+  outline: none;
+  border-color: var(--run);
+  box-shadow: var(--ring);
+}
+/* 原生上下箭头在 32px 高的窄框里会压住数字；键盘 ↑/↓ 仍按 step 调 */
+.input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.input::-webkit-outer-spin-button,
+.input::-webkit-inner-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
 }
 .err {
   margin: 10px 0 0;
